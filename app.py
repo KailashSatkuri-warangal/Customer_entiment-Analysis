@@ -4,17 +4,25 @@ import streamlit as st
 import plotly.express as px
 import time
 import os
+import pickle
+import logging
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+# Configure minimal logging
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
 
 nltk.download('vader_lexicon', quiet=True)
 sid = SentimentIntensityAnalyzer()
 
 def clean_text(text):
+    """Minimal text cleaning."""
     if pd.isna(text):
         return ""
     return str(text).strip()
 
 def analyze_sentiment(text):
+    """Analyze sentiment using VADER."""
     score = sid.polarity_scores(text)
     compound = score['compound']
     if compound >= 0.05:
@@ -23,33 +31,88 @@ def analyze_sentiment(text):
         return 'negative', compound
     return 'neutral', compound
 
-def load_data(file_path, review_col, encoding='utf-8'):
+@st.cache_data(show_spinner=False)
+def load_data(file_path, review_col, encoding='utf-8', sample_size=500):
+    """Load and preprocess data with caching and sampling for memory efficiency."""
     try:
+        cache_file = file_path + '.pkl'
+        # Check if cache exists and is valid
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    df = pickle.load(f)
+                    # Verify required columns
+                    if 'sentiment' not in df.columns or 'sentiment_score' not in df.columns:
+                        st.warning(f"Invalid cache for {file_path}. Attempting to regenerate...")
+                        try:
+                            os.remove(cache_file)  # Try to delete invalid cache
+                        except PermissionError as pe:
+                            st.error(
+                                f"Cannot delete {cache_file}: {pe}. "
+                                "Please close any programs accessing this file (e.g., file explorer, IDE) "
+                                "or manually delete it and retry."
+                            )
+                    else:
+                        return df
+            except Exception as e:
+                st.warning(f"Error reading cache {cache_file}: {e}. Regenerating...")
+
+        # Load data
         if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path, encoding=encoding, on_bad_lines='skip')
+            df = pd.read_csv(file_path, encoding=encoding, usecols=[review_col], low_memory=False)
         elif file_path.endswith('.xlsx'):
-            df = pd.read_excel(file_path)
+            df = pd.read_excel(file_path, usecols=[review_col], engine='openpyxl')
         else:
             st.error(f"Unsupported file format: {file_path}")
             return None
 
-        # Check if the required column exists
+        # Verify column existence
         if review_col not in df.columns:
-            st.error(f"Column '{review_col}' not found in the dataset.")
+            st.error(f"Column '{review_col}' not found in {file_path}. Available columns: {df.columns.tolist()}")
             return None
-        
+
+        # Sample data to reduce memory usage
+        df = df.sample(n=min(sample_size, len(df)), random_state=42) if len(df) > sample_size else df
+
         # Clean and analyze sentiment
         df['cleaned_review'] = df[review_col].apply(clean_text)
-        sentiments = df['cleaned_review'].apply(analyze_sentiment).apply(pd.Series)
-        df['sentiment'] = sentiments[0]
-        df['sentiment_score'] = sentiments[1]
+        sentiments = df['cleaned_review'].apply(analyze_sentiment)
+        df['sentiment'] = [s[0] for s in sentiments]
+        df['sentiment_score'] = [s[1] for s in sentiments]
+
+        # Try to cache results
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(df[['cleaned_review', 'sentiment', 'sentiment_score']], f)
+        except PermissionError as pe:
+            print(
+                f"Cannot write cache to {cache_file}: {pe}. "
+                "Data loaded without caching. Please close programs accessing this file."
+            )
         return df
     except Exception as e:
-        st.error(f"Error loading {file_path}: {e}")
+        print(f"Error loading {file_path}: {str(e)}")
         return None
 
+@st.cache_data(show_spinner=False)
+def compute_comparison_data(platforms_info, data_dir, selected_platforms):
+    """Cache comparison data for selected platforms."""
+    all_data = []
+    for platform_name, path, review_col, encoding in platforms_info:
+        if platform_name in selected_platforms:
+            df = load_data(path, review_col, encoding)
+            if df is not None:
+                summary = {
+                    'Platform': platform_name,
+                    'Positive': (df['sentiment'] == 'positive').sum(),
+                    'Negative': (df['sentiment'] == 'negative').sum(),
+                    'Neutral': (df['sentiment'] == 'neutral').sum()
+                }
+                all_data.append(summary)
+    return pd.DataFrame(all_data) if all_data else None
+
 def plot_sentiment_distribution(df, platform_name):
-    time.sleep(2)
+    """Visualize sentiment distribution for a platform."""
     summary = {
         'positive': (df['sentiment'] == 'positive').sum(),
         'negative': (df['sentiment'] == 'negative').sum(),
@@ -107,7 +170,62 @@ def main():
     )
 
     data_dir = 'data'
+    os.makedirs(data_dir, exist_ok=True)
 
+    platforms_info = [
+        ("BestBuy", os.path.join(data_dir, 'BestBut_Review.xlsx'), 'review_text', 'utf-8'),
+        ("eBay", os.path.join(data_dir, 'ebay_reviews.csv'), 'review content', 'utf-8'),
+        ("Flipkart", os.path.join(data_dir, 'flipkart_product.csv'), 'Summary', 'latin1'),
+        ("Walmart", os.path.join(data_dir, 'wallmart_review.csv'), 'Review', 'utf-8')
+    ]
+
+    # Sidebar for comparison and individual platform selection
+    st.sidebar.title("📊 Comparison")
+    selected_platforms = st.sidebar.multiselect(
+        "Select Platforms to Compare",
+        [p[0] for p in platforms_info],
+        default=[p[0] for p in platforms_info]  # Default to all platforms
+    )
+    compare_button = st.sidebar.button("Generate Comparison")
+
+    # Comparison section at the top
+    st.subheader("📊 Sentiment Count Comparison Across Companies")
+    if compare_button and selected_platforms:
+        with st.spinner('🔄 Generating Comparison...'):
+            start_time = time.time()
+            comparison_df = compute_comparison_data(platforms_info, data_dir, tuple(selected_platforms))
+            if comparison_df is not None:
+                fig = px.bar(
+                    comparison_df.melt(id_vars='Platform', value_vars=['Positive', 'Negative', 'Neutral']),
+                    x='Platform',
+                    y='value',
+                    color='variable',
+                    barmode='group',
+                    labels={'value': 'Reviews', 'variable': ''},
+                    height=400,
+                    template='simple_white',
+                )
+                fig.update_layout(margin=dict(l=20, r=20, t=20, b=20), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+
+                st.subheader("🧠 3D Sentiment Distribution")
+                fig3d = px.scatter_3d(
+                    comparison_df,
+                    x='Positive',
+                    y='Negative',
+                    z='Neutral',
+                    color='Platform',
+                    size='Positive',
+                    height=400,
+                    template='simple_white',
+                )
+                fig3d.update_layout(margin=dict(l=20, r=20, t=20, b=20))
+                st.plotly_chart(fig3d, use_container_width=True, config={'displayModeBar': False})
+            else:
+                st.warning("No data available for selected platforms.")
+            st.info(f"Comparison completed in {time.time() - start_time:.2f} seconds")
+
+    # Individual platform analysis
     st.sidebar.title("📁 Platforms")
     platform = st.sidebar.selectbox("Choose a Platform", (
         "Amazon", "BestBuy", "eBay", "Flipkart", "Walmart", "Sixth"))
@@ -159,60 +277,6 @@ def main():
                 df = load_data(os.path.join(data_dir, 'sixth_file.csv'), 'review')
                 if df is not None:
                     plot_sentiment_distribution(df, "Sixth Platform")
-
-    st.subheader("📊 Sentiment Count Comparison Across Companies")
-
-    platforms_info = [
-        ("Amazon", os.path.join(data_dir, 'amazon_review.csv'), 'reviewText', 'utf-8'),
-        ("BestBuy", os.path.join(data_dir, 'BestBut_Review.xlsx'), 'review_text', 'utf-8'),
-        ("eBay", os.path.join(data_dir, 'ebay_reviews.csv'), 'review content', 'utf-8'),
-        ("Flipkart", os.path.join(data_dir, 'flipkart_product.csv'), 'Summary', 'latin1'),
-        ("Walmart", os.path.join(data_dir, 'wallmart_review.csv'), 'Review', 'utf-8'),
-        ("Sixth", os.path.join(data_dir, 'sixth_file.csv'), 'review', 'utf-8')
-    ]
-
-    all_data = []
-    for platform_name, path, review_col, encoding in platforms_info:
-        df = load_data(path, review_col, encoding)
-        if df is not None:
-            summary = {
-                'Platform': platform_name,
-                'Positive': (df['sentiment'] == 'positive').sum(),
-                'Negative': (df['sentiment'] == 'negative').sum(),
-                'Neutral': (df['sentiment'] == 'neutral').sum()
-            }
-            all_data.append(summary)
-
-    if all_data:
-        comparison_df = pd.DataFrame(all_data)
-
-        time.sleep(2)
-
-        fig = px.bar(
-            comparison_df.melt(id_vars='Platform', value_vars=['Positive', 'Negative', 'Neutral']),
-            x='Platform',
-            y='value',
-            color='variable',
-            barmode='group',
-            title="Sentiment Comparison Across Platforms",
-            labels={'value': 'Number of Reviews', 'variable': 'Sentiment'},
-            height=600
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("🧠 3D Sentiment Distribution")
-
-        fig3d = px.scatter_3d(
-            comparison_df,
-            x='Positive',
-            y='Negative',
-            z='Neutral',
-            color='Platform',
-            size='Positive',
-            title="3D Sentiment Distribution Across Platforms",
-            height=600
-        )
-        st.plotly_chart(fig3d, use_container_width=True)
 
 if __name__ == "__main__":
     main()
